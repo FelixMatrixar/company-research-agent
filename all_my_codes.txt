@@ -1,0 +1,592 @@
+﻿========== agent.py ==========
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import json
+import os
+import re
+from datetime import datetime, timezone
+
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
+
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+if not OPENROUTER_API_KEY:
+    raise RuntimeError("OPENROUTER_API_KEY environment variable is not set")
+
+MODEL = "google/gemini-2.5-flash-lite"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+_PROMPT = """\
+You are a technology company analyst. Analyze the following GitHub project and classify it.
+
+Project: {name}
+Description: {description}
+Stars: {stars}
+Primary Language: {language}
+
+Return ONLY a JSON object with exactly these keys:
+- "industry": the industry sector (e.g. "Developer Tools", "AI/ML", "Security", "Finance", "DevOps")
+- "business_model": how it generates value (e.g. "Open Source Library", "Open Source Framework", "SaaS", "CLI Tool")
+- "summary": 2-3 sentences describing what this project does
+- "use_case": the primary problem it solves, in one sentence
+
+Return only the JSON object. No markdown, no explanation."""
+
+
+def _strip_fences(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+    text = re.sub(r"\n?```\s*$", "", text)
+    return text.strip()
+
+
+def analyze_company(
+    company_id: int,
+    name: str,
+    description: str | None,
+    stars: int | None,
+    language: str | None,
+) -> dict:
+    from database import get_raw_response, save_analysis
+
+    cached = get_raw_response(company_id)
+    if cached:
+        print(f"  [cache] {name}")
+        return json.loads(_strip_fences(cached))
+
+    prompt = _PROMPT.format(
+        name=name,
+        description=description or "No description provided",
+        stars=stars or 0,
+        language=language or "Unknown",
+    )
+
+    with httpx.Client(timeout=60) as client:
+        resp = client.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+        resp.raise_for_status()
+
+    raw = resp.json()["choices"][0]["message"]["content"]
+    parsed = json.loads(_strip_fences(raw))
+
+    save_analysis(
+        company_id=company_id,
+        industry=parsed["industry"],
+        business_model=parsed["business_model"],
+        summary=parsed["summary"],
+        use_case=parsed["use_case"],
+        raw_response=raw,
+        analyzed_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    return parsed
+
+
+def run() -> None:
+    from database import get_unanalyzed_companies
+
+    companies = get_unanalyzed_companies()
+    print(f"Analysing {len(companies)} unanalyzed companies...")
+
+    for c in companies:
+        print(f"  â†’ {c['name']}")
+        try:
+            analyze_company(
+                company_id=c["id"],
+                name=c["name"],
+                description=c.get("description"),
+                stars=c.get("stars"),
+                language=c.get("language"),
+            )
+        except Exception as exc:
+            print(f"  [error] {c['name']}: {exc}")
+
+
+if __name__ == "__main__":
+    run()
+
+========== api.py ==========
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from fastapi import FastAPI, Header, HTTPException
+
+import database
+
+database.init_db()
+
+app = FastAPI(title="Company Research Agent")
+
+_PIPELINE_SECRET = os.environ.get("PIPELINE_SECRET", "")
+
+
+@app.get("/companies")
+def list_companies(
+    industry: str | None = None,
+    model: str | None = None,
+    page: int = 1,
+    per_page: int = 20,
+) -> list[dict]:
+    return database.get_all_companies(
+        industry=industry,
+        business_model=model,
+        page=page,
+        per_page=per_page,
+    )
+
+
+@app.get("/companies/{company_id}")
+def get_company(company_id: int) -> dict:
+    company = database.get_company_by_id(company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    return company
+
+
+@app.get("/companies/{company_id}/analysis")
+def get_company_analysis(company_id: int) -> dict:
+    analysis = database.get_analysis_by_company_id(company_id)
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    return analysis
+
+
+@app.get("/stats")
+def get_stats() -> dict:
+    return database.get_stats()
+
+
+@app.post("/pipeline/run")
+def run_pipeline(x_api_key: str | None = Header(default=None)) -> dict:
+    if not _PIPELINE_SECRET or x_api_key != _PIPELINE_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key header")
+
+    import collect
+    import agent
+
+    try:
+        collect.run()
+        agent.run()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {"status": "ok", "stats": database.get_stats()}
+
+========== collect.py ==========
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from datetime import datetime, timezone
+
+import requests
+
+GITHUB_SEARCH_URL = "https://api.github.com/search/repositories"
+GITHUB_QUERY = "stars:>1000 pushed:>2024-01-01"
+HEADERS = {
+    "User-Agent": "company-research-agent/1.0",
+    "Accept": "application/vnd.github+json",
+}
+
+# Fallback used when the GitHub API is rate-limited or unreachable.
+SEED_COMPANIES = [
+    {"name": "vercel/next.js",        "description": "The React Framework for the Web",                         "github_url": "https://github.com/vercel/next.js",        "stars": 120000, "language": "JavaScript", "website": "https://nextjs.org"},
+    {"name": "facebook/react",         "description": "The library for web and native user interfaces",          "github_url": "https://github.com/facebook/react",         "stars": 225000, "language": "JavaScript", "website": "https://react.dev"},
+    {"name": "microsoft/vscode",       "description": "Visual Studio Code",                                      "github_url": "https://github.com/microsoft/vscode",       "stars": 160000, "language": "TypeScript",  "website": "https://code.visualstudio.com"},
+    {"name": "openai/openai-python",   "description": "The official Python library for the OpenAI API",          "github_url": "https://github.com/openai/openai-python",   "stars": 23000,  "language": "Python",      "website": "https://openai.com"},
+    {"name": "anthropics/anthropic-sdk-python", "description": "The official Python SDK for Anthropic's APIs", "github_url": "https://github.com/anthropics/anthropic-sdk-python", "stars": 4000, "language": "Python", "website": "https://anthropic.com"},
+    {"name": "huggingface/transformers","description": "State-of-the-art ML for PyTorch, TensorFlow, and JAX",  "github_url": "https://github.com/huggingface/transformers","stars": 132000, "language": "Python",      "website": "https://huggingface.co"},
+    {"name": "langchain-ai/langchain", "description": "Build context-aware reasoning applications",              "github_url": "https://github.com/langchain-ai/langchain", "stars": 94000,  "language": "Python",      "website": "https://langchain.com"},
+    {"name": "rust-lang/rust",         "description": "A language empowering everyone to build reliable software","github_url": "https://github.com/rust-lang/rust",         "stars": 97000,  "language": "Rust",        "website": "https://rust-lang.org"},
+    {"name": "golang/go",              "description": "The Go programming language",                             "github_url": "https://github.com/golang/go",              "stars": 124000, "language": "Go",          "website": "https://go.dev"},
+    {"name": "astral-sh/uv",           "description": "An extremely fast Python package and project manager",    "github_url": "https://github.com/astral-sh/uv",           "stars": 38000,  "language": "Rust",        "website": "https://astral.sh"},
+    {"name": "supabase/supabase",      "description": "The open source Firebase alternative",                   "github_url": "https://github.com/supabase/supabase",      "stars": 73000,  "language": "TypeScript",  "website": "https://supabase.com"},
+    {"name": "trufflesecurity/trufflehog","description": "Find, verify, and analyze leaked credentials",        "github_url": "https://github.com/trufflesecurity/trufflehog","stars": 17000,"language": "Go",          "website": "https://trufflesecurity.com"},
+    {"name": "grafana/grafana",        "description": "Open source observability and data visualization platform","github_url": "https://github.com/grafana/grafana",        "stars": 64000,  "language": "TypeScript",  "website": "https://grafana.com"},
+    {"name": "hashicorp/terraform",    "description": "Infrastructure as Code tool by HashiCorp",               "github_url": "https://github.com/hashicorp/terraform",    "stars": 43000,  "language": "Go",          "website": "https://terraform.io"},
+    {"name": "kubernetes/kubernetes",  "description": "Production-grade container scheduling and management",    "github_url": "https://github.com/kubernetes/kubernetes",  "stars": 111000, "language": "Go",          "website": "https://kubernetes.io"},
+    {"name": "docker/compose",         "description": "Define and run multi-container applications with Docker", "github_url": "https://github.com/docker/compose",         "stars": 34000,  "language": "Go",          "website": "https://docker.com"},
+    {"name": "vitejs/vite",            "description": "Next generation frontend tooling",                        "github_url": "https://github.com/vitejs/vite",            "stars": 68000,  "language": "TypeScript",  "website": "https://vite.dev"},
+    {"name": "prisma/prisma",          "description": "Next-generation ORM for Node.js and TypeScript",          "github_url": "https://github.com/prisma/prisma",          "stars": 40000,  "language": "TypeScript",  "website": "https://prisma.io"},
+    {"name": "tiangolo/fastapi",       "description": "High performance web framework for building APIs with Python","github_url": "https://github.com/tiangolo/fastapi",  "stars": 78000,  "language": "Python",      "website": "https://fastapi.tiangolo.com"},
+    {"name": "neovim/neovim",          "description": "Vim-fork focused on extensibility and usability",         "github_url": "https://github.com/neovim/neovim",          "stars": 82000,  "language": "Vim Script",  "website": "https://neovim.io"},
+]
+
+
+def _fetch_from_api(per_page: int = 50) -> list[dict]:
+    resp = requests.get(
+        GITHUB_SEARCH_URL,
+        headers=HEADERS,
+        params={
+            "q": GITHUB_QUERY,
+            "sort": "stars",
+            "order": "desc",
+            "per_page": per_page,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    items = resp.json().get("items", [])
+    return [
+        {
+            "name": item["full_name"],
+            "website": item.get("homepage") or None,
+            "description": item.get("description"),
+            "github_url": item["html_url"],
+            "stars": item.get("stargazers_count"),
+            "language": item.get("language"),
+        }
+        for item in items
+    ]
+
+
+def _use_seed() -> list[dict]:
+    print("  Using SEED_COMPANIES fallback.")
+    return SEED_COMPANIES
+
+
+def _fetch_repos() -> list[dict]:
+    try:
+        repos = _fetch_from_api()
+        if repos:
+            return repos
+        print("GitHub API returned no results.")
+        return _use_seed()
+    except requests.exceptions.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code in (403, 429):
+            print(f"GitHub API rate-limited ({exc.response.status_code}).")
+        else:
+            print(f"GitHub API HTTP error: {exc}")
+        return _use_seed()
+    except requests.exceptions.RequestException as exc:
+        print(f"GitHub API unreachable: {exc}")
+        return _use_seed()
+
+
+def run() -> int:
+    from database import init_db, save_company
+
+    init_db()
+    collected_at = datetime.now(timezone.utc).isoformat()
+
+    print("Fetching repos from GitHub API...")
+    repos = _fetch_repos()
+
+    for repo in repos:
+        save_company(
+            name=repo["name"],
+            website=repo.get("website"),
+            description=repo.get("description"),
+            github_url=repo["github_url"],
+            stars=repo.get("stars"),
+            language=repo.get("language"),
+            collected_at=collected_at,
+        )
+
+    print(f"Collected {len(repos)} repos.")
+    return len(repos)
+
+
+if __name__ == "__main__":
+    run()
+
+========== database.py ==========
+import sqlite3
+from pathlib import Path
+from datetime import datetime, timezone
+
+DB_PATH = Path(__file__).resolve().parent.parent / "data" / "companies.db"
+
+
+def _connect() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db() -> None:
+    with _connect() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS companies (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                name         TEXT NOT NULL UNIQUE,
+                website      TEXT,
+                description  TEXT,
+                github_url   TEXT,
+                stars        INTEGER,
+                language     TEXT,
+                collected_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS analysis (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id     INTEGER NOT NULL REFERENCES companies(id),
+                industry       TEXT NOT NULL,
+                business_model TEXT NOT NULL,
+                summary        TEXT NOT NULL,
+                use_case       TEXT NOT NULL,
+                raw_response   TEXT,
+                analyzed_at    TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_analysis_industry ON analysis(industry);
+        """)
+
+
+def save_company(
+    name: str,
+    website: str | None,
+    description: str | None,
+    github_url: str | None,
+    stars: int | None,
+    language: str | None,
+    collected_at: str,
+) -> int:
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO companies (name, website, description, github_url, stars, language, collected_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                website      = excluded.website,
+                description  = excluded.description,
+                github_url   = excluded.github_url,
+                stars        = excluded.stars,
+                language     = excluded.language,
+                collected_at = excluded.collected_at
+            """,
+            (name, website, description, github_url, stars, language, collected_at),
+        )
+        row = conn.execute("SELECT id FROM companies WHERE name = ?", (name,)).fetchone()
+        return row["id"]
+
+
+def get_all_companies(
+    industry: str | None = None,
+    business_model: str | None = None,
+    page: int = 1,
+    per_page: int = 20,
+) -> list[dict]:
+    offset = (page - 1) * per_page
+    query = """
+        SELECT
+            c.id, c.name, c.website, c.description, c.github_url,
+            c.stars, c.language, c.collected_at,
+            a.industry, a.business_model, a.summary, a.use_case, a.analyzed_at
+        FROM companies c
+        LEFT JOIN analysis a ON a.company_id = c.id
+        WHERE 1=1
+    """
+    params: list = []
+    if industry:
+        query += " AND LOWER(a.industry) = LOWER(?)"
+        params.append(industry)
+    if business_model:
+        query += " AND LOWER(a.business_model) = LOWER(?)"
+        params.append(business_model)
+    query += " ORDER BY c.stars DESC LIMIT ? OFFSET ?"
+    params.extend([per_page, offset])
+
+    with _connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_company_by_id(company_id: int) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                c.id, c.name, c.website, c.description, c.github_url,
+                c.stars, c.language, c.collected_at,
+                a.industry, a.business_model, a.summary, a.use_case, a.analyzed_at
+            FROM companies c
+            LEFT JOIN analysis a ON a.company_id = c.id
+            WHERE c.id = ?
+            """,
+            (company_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_analysis_by_company_id(company_id: int) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT id, company_id, industry, business_model, summary,
+                   use_case, raw_response, analyzed_at
+            FROM analysis
+            WHERE company_id = ?
+            """,
+            (company_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_raw_response(company_id: int) -> str | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT raw_response FROM analysis WHERE company_id = ?",
+            (company_id,),
+        ).fetchone()
+        return row["raw_response"] if row else None
+
+
+def save_analysis(
+    company_id: int,
+    industry: str,
+    business_model: str,
+    summary: str,
+    use_case: str,
+    raw_response: str,
+    analyzed_at: str,
+) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO analysis
+                (company_id, industry, business_model, summary, use_case, raw_response, analyzed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (company_id, industry, business_model, summary, use_case, raw_response, analyzed_at),
+        )
+
+
+def get_unanalyzed_companies() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT c.id, c.name, c.description, c.stars, c.language
+            FROM companies c
+            LEFT JOIN analysis a ON a.company_id = c.id
+            WHERE a.id IS NULL
+            """,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_stats() -> dict:
+    with _connect() as conn:
+        total_companies = conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
+        total_analyzed = conn.execute("SELECT COUNT(*) FROM analysis").fetchone()[0]
+        coverage_pct = (
+            round(total_analyzed / total_companies * 100, 1) if total_companies else 0.0
+        )
+        industry_rows = conn.execute(
+            """
+            SELECT industry, COUNT(*) AS count
+            FROM analysis
+            GROUP BY industry
+            ORDER BY count DESC
+            """
+        ).fetchall()
+        return {
+            "total_companies": total_companies,
+            "total_analyzed": total_analyzed,
+            "coverage_pct": coverage_pct,
+            "by_industry": [dict(r) for r in industry_rows],
+        }
+
+========== mcp_server.py ==========
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from mcp.server.fastmcp import FastMCP
+
+import database
+
+database.init_db()
+
+mcp = FastMCP("company-research")
+
+
+@mcp.tool()
+def search_companies(industry: str | None = None, query: str | None = None) -> list[dict]:
+    """Filter companies by industry and/or a name/description keyword."""
+    results = database.get_all_companies(industry=industry, page=1, per_page=200)
+    if query:
+        q = query.lower()
+        results = [
+            c for c in results
+            if q in (c.get("name") or "").lower()
+            or q in (c.get("description") or "").lower()
+        ]
+    return results
+
+
+@mcp.tool()
+def get_company(id: int) -> dict:
+    """Return a full company record including its analysis."""
+    company = database.get_company_by_id(id)
+    if not company:
+        return {"error": f"No company found with id={id}"}
+    return company
+
+
+@mcp.tool()
+def get_stats() -> dict:
+    """Return aggregate statistics: total companies, analysis coverage, and industry breakdown."""
+    return database.get_stats()
+
+
+if __name__ == "__main__":
+    mcp.run()
+
+========== pipeline.py ==========
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import collect
+import agent
+
+
+def run() -> None:
+    print("=== Stage 1: collect ===")
+    collect.run()
+
+    print("=== Stage 2: analyse ===")
+    agent.run()
+
+    print("=== Pipeline complete ===")
+
+
+if __name__ == "__main__":
+    run()
+
