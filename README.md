@@ -74,6 +74,11 @@ The API is deployed and publicly accessible:
 | http://45.63.56.26:8000/companies | List all companies |
 | http://45.63.56.26:8000/stats | Aggregate statistics |
 
+### Action in MCP
+
+[Claude MCP Showcase](https://github.com/user-attachments/assets/dce858b1-d34b-4f61-ae0a-13972f521df7)
+
+
 ---
 
 ## Quick Start
