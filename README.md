@@ -6,17 +6,18 @@ An AI-powered pipeline that collects open-source company data from GitHub, analy
 
 ## Table of Contents
 
-1. [Architecture Overview](#architecture-overview)
-2. [Quick Start](#quick-start)
-3. [Environment Variables](#environment-variables)
-4. [Running the System](#running-the-system)
-5. [API Reference](#api-reference)
-6. [MCP Server](#mcp-server)
-7. [How the AI Agent Works](#how-the-ai-agent-works)
-8. [Database Schema](#database-schema)
-9. [Project Structure](#project-structure)
-10. [Design Decisions & Assumptions](#design-decisions--assumptions)
-11. [Agentic Tool Usage — Claude Code](#agentic-tool-usage--claude-code)
+1. [Live Demo](#live-demo)
+2. [Architecture Overview](#architecture-overview)
+3. [Quick Start](#quick-start)
+4. [Environment Variables](#environment-variables)
+5. [Running the System](#running-the-system)
+6. [API Reference](#api-reference)
+7. [MCP Server](#mcp-server)
+8. [How the AI Agent Works](#how-the-ai-agent-works)
+9. [Database Schema](#database-schema)
+10. [Project Structure](#project-structure)
+11. [Design Decisions & Assumptions](#design-decisions--assumptions)
+12. [Agentic Tool Usage — Claude Code](#agentic-tool-usage--claude-code)
 
 ---
 
@@ -60,6 +61,18 @@ An AI-powered pipeline that collects open-source company data from GitHub, analy
 2. `agent.py` picks up every company that has no analysis row yet, builds a structured prompt, calls **Google Gemini 2.5 Flash Lite** via OpenRouter, and writes the parsed JSON back to the `analysis` table.
 3. `api.py` exposes the data over HTTP with filtering, pagination, and a protected pipeline trigger endpoint.
 4. `mcp_server.py` wraps the same database queries as MCP tools so any MCP-compatible AI agent (including Claude Code itself) can query the data.
+
+---
+
+## Live Demo
+
+The API is deployed and publicly accessible:
+
+| URL | Description |
+|-----|-------------|
+| http://45.63.56.26:8000/docs | Interactive Swagger UI |
+| http://45.63.56.26:8000/companies | List all companies |
+| http://45.63.56.26:8000/stats | Aggregate statistics |
 
 ---
 
